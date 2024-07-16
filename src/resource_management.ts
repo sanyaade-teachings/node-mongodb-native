@@ -3,6 +3,6 @@
  * @experimental
  */
 export interface AsyncDisposable {
-	/** @beta */
-	[Symbol.asyncDispose]: () => Promise<void>;
+  /** @beta */
+  [Symbol.asyncDispose]: () => Promise<void>;
 }

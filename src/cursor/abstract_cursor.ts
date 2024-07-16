@@ -17,10 +17,10 @@ import { GetMoreOperation } from '../operations/get_more';
 import { KillCursorsOperation } from '../operations/kill_cursors';
 import { ReadConcern, type ReadConcernLike } from '../read_concern';
 import { ReadPreference, type ReadPreferenceLike } from '../read_preference';
+import { type AsyncDisposable } from '../resource_management';
 import type { Server } from '../sdam/server';
 import { ClientSession, maybeClearPinnedConnection } from '../sessions';
 import { type MongoDBNamespace, squashError } from '../utils';
-import { AsyncDisposable } from '../resource_management';
 
 /**
  * @internal
@@ -125,9 +125,12 @@ export type AbstractCursorEvents = {
 
 /** @public */
 export abstract class AbstractCursor<
-  TSchema = any,
-  CursorEvents extends AbstractCursorEvents = AbstractCursorEvents
-> extends TypedEventEmitter<CursorEvents> implements AsyncDisposable {
+    TSchema = any,
+    CursorEvents extends AbstractCursorEvents = AbstractCursorEvents
+  >
+  extends TypedEventEmitter<CursorEvents>
+  implements AsyncDisposable
+{
   /** @internal */
   private cursorId: Long | null;
   /** @internal */
@@ -921,6 +924,7 @@ class ReadableCursorStream extends Readable {
   }
 }
 
-Symbol.asyncDispose && (AbstractCursor.prototype[Symbol.asyncDispose] = async function() {
-  await this.close();
-})
+Symbol.asyncDispose &&
+  (AbstractCursor.prototype[Symbol.asyncDispose] = async function () {
+    await this.close();
+  });

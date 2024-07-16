@@ -107,11 +107,11 @@ export { CURSOR_FLAGS } from './cursor/abstract_cursor';
 export { MongoErrorLabel } from './error';
 export { ExplainVerbosity } from './explain';
 export { ServerApiVersion } from './mongo_client';
-export { AsyncDisposable } from './resource_management';
 export { ReturnDocument } from './operations/find_and_modify';
 export { ProfilingLevel } from './operations/set_profiling_level';
 export { ReadConcernLevel } from './read_concern';
 export { ReadPreferenceMode } from './read_preference';
+export { AsyncDisposable } from './resource_management';
 export { ServerType, TopologyType } from './sdam/common';
 
 // Helper classes

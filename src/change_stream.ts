@@ -14,11 +14,11 @@ import {
   MongoRuntimeError
 } from './error';
 import { MongoClient } from './mongo_client';
-import { AsyncDisposable } from './resource_management';
 import { type InferIdType, TypedEventEmitter } from './mongo_types';
 import type { AggregateOptions } from './operations/aggregate';
 import type { CollationOptions, OperationParent } from './operations/command';
 import type { ReadPreference } from './read_preference';
+import { type AsyncDisposable } from './resource_management';
 import type { ServerSessionId } from './sessions';
 import { filterOptions, getTopology, type MongoDBNamespace, squashError } from './utils';
 
@@ -994,6 +994,7 @@ export class ChangeStream<
   }
 }
 
-Symbol.asyncDispose && (ChangeStream.prototype[Symbol.asyncDispose] = async function() {
-  await this.close();
-})
+Symbol.asyncDispose &&
+  (ChangeStream.prototype[Symbol.asyncDispose] = async function () {
+    await this.close();
+  });

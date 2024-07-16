@@ -34,6 +34,7 @@ import { executeOperation } from './operations/execute_operation';
 import { RunAdminCommandOperation } from './operations/run_command';
 import type { ReadConcern, ReadConcernLevel, ReadConcernLike } from './read_concern';
 import { ReadPreference, type ReadPreferenceMode } from './read_preference';
+import { type AsyncDisposable } from './resource_management';
 import type { ServerMonitoringMode } from './sdam/monitor';
 import type { TagSet } from './sdam/server_description';
 import { readPreferenceServerSelector } from './sdam/server_selection';
@@ -54,7 +55,6 @@ import {
   squashError
 } from './utils';
 import type { W, WriteConcern, WriteConcernSettings } from './write_concern';
-import { AsyncDisposable } from './resource_management';
 
 /** @public */
 export const ServerApiVersion = Object.freeze({
@@ -762,9 +762,10 @@ export class MongoClient extends TypedEventEmitter<MongoClientEvents> implements
   }
 }
 
-Symbol.asyncDispose && (MongoClient.prototype[Symbol.asyncDispose] = async function() {
-  await this.close();
-})
+Symbol.asyncDispose &&
+  (MongoClient.prototype[Symbol.asyncDispose] = async function () {
+    await this.close();
+  });
 
 /**
  * Parsed Mongo Client Options.
