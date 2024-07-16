@@ -24,6 +24,7 @@ import {
   type MongoDriverError,
   MongoError,
   MongoErrorLabel,
+  MongoNetworkTimeoutError,
   MongoOperationTimeoutError,
   MongoRuntimeError,
   MongoServerSelectionError,
@@ -44,6 +45,7 @@ import {
   makeStateMachine,
   now,
   ns,
+  once,
   promiseWithResolvers,
   shuffle
 } from '../utils';
@@ -440,6 +442,8 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
       )
     );
 
+    // Create a wait condition that blocks until we get at least once successful heartbeat
+    const heartbeatWaitCond = once(this, Server.SERVER_HEARTBEAT_SUCCEEDED);
     // connect all known servers, then attempt server selection to connect
     const serverDescriptions = Array.from(this.s.description.servers.values());
     this.s.servers = new Map(
@@ -486,6 +490,17 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
         this.emit(Topology.CONNECT, this);
 
         return this;
+      } else if (!this.s.options.loadBalanced) {
+        try {
+          await Promise.race([
+            Timeout.expires(this.client.s.options.serverSelectionTimeoutMS),
+            heartbeatWaitCond
+          ]);
+        } catch (error) {
+          throw new MongoNetworkTimeoutError(
+            `Failed to contact server after ${this.client.s.options.serverSelectionTimeoutMS}ms`
+          );
+        }
       }
 
       stateTransition(this, STATE_CONNECTED);
