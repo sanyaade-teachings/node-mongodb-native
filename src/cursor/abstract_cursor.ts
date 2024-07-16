@@ -20,6 +20,7 @@ import { ReadPreference, type ReadPreferenceLike } from '../read_preference';
 import type { Server } from '../sdam/server';
 import { ClientSession, maybeClearPinnedConnection } from '../sessions';
 import { type MongoDBNamespace, squashError } from '../utils';
+import { AsyncDisposable } from '../resource_management';
 
 /**
  * @internal
@@ -126,7 +127,7 @@ export type AbstractCursorEvents = {
 export abstract class AbstractCursor<
   TSchema = any,
   CursorEvents extends AbstractCursorEvents = AbstractCursorEvents
-> extends TypedEventEmitter<CursorEvents> {
+> extends TypedEventEmitter<CursorEvents> implements AsyncDisposable {
   /** @internal */
   private cursorId: Long | null;
   /** @internal */
@@ -274,6 +275,9 @@ export abstract class AbstractCursor<
   get loadBalanced(): boolean {
     return !!this.cursorClient.topology?.loadBalanced;
   }
+
+  /** @beta */
+  declare [Symbol.asyncDispose]: () => Promise<void>;
 
   /** Returns current buffered documents length */
   bufferedCount(): number {
@@ -916,3 +920,7 @@ class ReadableCursorStream extends Readable {
     );
   }
 }
+
+Symbol.asyncDispose && (AbstractCursor.prototype[Symbol.asyncDispose] = async function() {
+  await this.close();
+})

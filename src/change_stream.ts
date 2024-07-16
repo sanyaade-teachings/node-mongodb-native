@@ -14,6 +14,7 @@ import {
   MongoRuntimeError
 } from './error';
 import { MongoClient } from './mongo_client';
+import { AsyncDisposable } from './resource_management';
 import { type InferIdType, TypedEventEmitter } from './mongo_types';
 import type { AggregateOptions } from './operations/aggregate';
 import type { CollationOptions, OperationParent } from './operations/command';
@@ -544,9 +545,15 @@ export type ChangeStreamEvents<
  * @public
  */
 export class ChangeStream<
-  TSchema extends Document = Document,
-  TChange extends Document = ChangeStreamDocument<TSchema>
-> extends TypedEventEmitter<ChangeStreamEvents<TSchema, TChange>> {
+    TSchema extends Document = Document,
+    TChange extends Document = ChangeStreamDocument<TSchema>
+  >
+  extends TypedEventEmitter<ChangeStreamEvents<TSchema, TChange>>
+  implements AsyncDisposable
+{
+  /** @beta */
+  declare [Symbol.asyncDispose]: () => Promise<void>;
+
   pipeline: Document[];
   /**
    * @remarks WriteConcern can still be present on the options because
@@ -986,3 +993,7 @@ export class ChangeStream<
     }
   }
 }
+
+Symbol.asyncDispose && (ChangeStream.prototype[Symbol.asyncDispose] = async function() {
+  await this.close();
+})

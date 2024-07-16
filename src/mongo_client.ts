@@ -54,6 +54,7 @@ import {
   squashError
 } from './utils';
 import type { W, WriteConcern, WriteConcernSettings } from './write_concern';
+import { AsyncDisposable } from './resource_management';
 
 /** @public */
 export const ServerApiVersion = Object.freeze({
@@ -344,7 +345,7 @@ const kOptions = Symbol('options');
  * await client.insertOne({ name: 'spot', kind: 'dog' });
  * ```
  */
-export class MongoClient extends TypedEventEmitter<MongoClientEvents> {
+export class MongoClient extends TypedEventEmitter<MongoClientEvents> implements AsyncDisposable {
   /** @internal */
   s: MongoClientPrivate;
   /** @internal */
@@ -403,6 +404,9 @@ export class MongoClient extends TypedEventEmitter<MongoClientEvents> {
     };
     this.checkForNonGenuineHosts();
   }
+
+  /** @beta */
+  declare [Symbol.asyncDispose]: () => Promise<void>;
 
   /** @internal */
   private checkForNonGenuineHosts() {
@@ -757,6 +761,10 @@ export class MongoClient extends TypedEventEmitter<MongoClientEvents> {
     return new ChangeStream<TSchema, TChange>(this, pipeline, resolveOptions(this, options));
   }
 }
+
+Symbol.asyncDispose && (MongoClient.prototype[Symbol.asyncDispose] = async function() {
+  await this.close();
+})
 
 /**
  * Parsed Mongo Client Options.
