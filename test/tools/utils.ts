@@ -14,6 +14,7 @@ import {
   type Document,
   type HostAddress,
   MongoClient,
+  type MongoOptions,
   OP_MSG,
   Topology,
   type TopologyOptions
@@ -500,13 +501,12 @@ export const sorted = <T>(iterable: Iterable<T>, how: (a: T, b: T) => 0 | 1 | -1
  * changes*/
 export function topologyWithPlaceholderClient(
   seeds: string | string[] | HostAddress | HostAddress[],
-  options: Partial<TopologyOptions>
+  options: Partial<MongoOptions>
 ): Topology {
-  return new Topology(
-    new MongoClient('mongodb://iLoveJavaScript'),
-    seeds,
-    options as TopologyOptions
-  );
+  return new Topology(new MongoClient('mongodb://iLoveJavaScript'), {
+    ...options,
+    hosts: seeds
+  } as MongoOptions);
 }
 
 export async function itInNodeProcess(
