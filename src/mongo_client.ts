@@ -1,27 +1,21 @@
-import { once } from 'events';
-import { promises as fs } from 'fs';
 import type { TcpNetConnectOpts } from 'net';
 import type { ConnectionOptions as TLSConnectionOptions, TLSSocketOptions } from 'tls';
 
 import { type BSONSerializeOptions, type Document, resolveBSONOptions } from './bson';
 import { ChangeStream, type ChangeStreamDocument, type ChangeStreamOptions } from './change_stream';
 import type { AutoEncrypter, AutoEncryptionOptions } from './client-side-encryption/auto_encrypter';
-import {
-  type AuthMechanismProperties,
-  DEFAULT_ALLOWED_HOSTS,
-  type MongoCredentials
-} from './cmap/auth/mongo_credentials';
+import { type AuthMechanismProperties, type MongoCredentials } from './cmap/auth/mongo_credentials';
 import { type TokenCache } from './cmap/auth/mongodb_oidc/token_cache';
-import { AuthMechanism } from './cmap/auth/providers';
+import { type AuthMechanism } from './cmap/auth/providers';
 import type { LEGAL_TCP_SOCKET_OPTIONS, LEGAL_TLS_SOCKET_OPTIONS } from './cmap/connect';
 import type { Connection } from './cmap/connection';
 import type { ClientMetadata } from './cmap/handshake/client_metadata';
 import type { CompressorName } from './cmap/wire_protocol/compression';
-import { parseOptions, resolveSRVRecord } from './connection_string';
-import { MONGO_CLIENT_EVENTS } from './constants';
+import { parseOptions } from './connection_string';
+import { type MONGO_CLIENT_EVENTS } from './constants';
 import { Db, type DbOptions } from './db';
 import type { Encrypter } from './encrypter';
-import { MongoInvalidArgumentError, MongoNetworkTimeoutError } from './error';
+import { MongoInvalidArgumentError } from './error';
 import { MongoClientAuthProviders } from './mongo_client_auth_providers';
 import {
   type LogComponentSeveritiesClientOptions,
@@ -35,22 +29,18 @@ import { executeOperation } from './operations/execute_operation';
 import { RunAdminCommandOperation } from './operations/run_command';
 import type { ReadConcern, ReadConcernLevel, ReadConcernLike } from './read_concern';
 import { ReadPreference, type ReadPreferenceMode } from './read_preference';
-import { STATE_CONNECTED, STATE_CONNECTING } from './sdam/common';
 import type { ServerMonitoringMode } from './sdam/monitor';
-import { Server } from './sdam/server';
 import type { TagSet } from './sdam/server_description';
 import { readPreferenceServerSelector } from './sdam/server_selection';
 import type { SrvPoller } from './sdam/srv_polling';
 import { Topology, type TopologyEvents } from './sdam/topology';
 import { ClientSession, type ClientSessionOptions, ServerSessionPool } from './sessions';
-import { Timeout } from './timeout';
 import {
   COSMOS_DB_CHECK,
   COSMOS_DB_MSG,
   DOCUMENT_DB_CHECK,
   DOCUMENT_DB_MSG,
   type HostAddress,
-  hostMatchesWildcards,
   isHostMatch,
   type MongoDBNamespace,
   ns,
@@ -352,7 +342,7 @@ export class MongoClient extends TypedEventEmitter<MongoClientEvents> {
   /** @internal */
   s: MongoClientPrivate;
   /** @internal */
-  topology?: Topology;
+  topology: Topology;
   /** @internal */
   override readonly mongoLogger: MongoLogger | undefined;
   /** @internal */
@@ -406,6 +396,8 @@ export class MongoClient extends TypedEventEmitter<MongoClientEvents> {
       }
     };
     this.checkForNonGenuineHosts();
+
+    this.topology = new Topology(this, this[kOptions]);
   }
 
   /** @internal */
@@ -477,16 +469,13 @@ export class MongoClient extends TypedEventEmitter<MongoClientEvents> {
   }
 
   /** @internal */
-  async _connectWithLock(options?: {
-    skipPing: boolean;
-    readPreference?: ReadPreference;
-  }): Promise<this> {
+  async _connectWithLock(): Promise<this> {
     if (this.connectionLock) {
       return await this.connectionLock;
     }
 
     try {
-      this.connectionLock = this._connect(options);
+      this.connectionLock = this._connect();
       await this.connectionLock;
     } finally {
       // release
@@ -502,21 +491,17 @@ export class MongoClient extends TypedEventEmitter<MongoClientEvents> {
    *
    * @internal
    */
-  private async _connect(options?: {
-    skipPing: boolean;
-    readPreference?: ReadPreference;
-  }): Promise<this> {
-    const topology = await this.initTopology();
-    const readPreference = options?.readPreference ?? this.readPreference;
+  private async _connect(): Promise<this> {
     const { encrypter } = this[kOptions];
     const topologyConnect = async () => {
       try {
         const skipPingOnConnect = this.s.options[Symbol.for('@@mdb.skipPingOnConnect')] === true;
-        if (!skipPingOnConnect && !options?.skipPing && topology.s.credentials != null) {
-          await this.db().admin().ping({ readPreference }); // goes through `executeOperation` so performs server selection
+        const hasCredentials = this.s.options.credentials != null;
+        if (!skipPingOnConnect && hasCredentials) {
+          await this.db().admin().ping({ readPreference: this[kOptions].readPreference });
         }
       } catch (error) {
-        topology.close();
+        this.topology.close();
         throw error;
       }
     };
@@ -530,69 +515,6 @@ export class MongoClient extends TypedEventEmitter<MongoClientEvents> {
     }
 
     return this;
-  }
-
-  /** @internal */
-  async initTopology() {
-    if (this.topology && this.topology.isConnected()) {
-      return this.topology;
-    }
-
-    const topologyOptions = this[kOptions];
-
-    if (topologyOptions.tls) {
-      if (typeof topologyOptions.tlsCAFile === 'string') {
-        topologyOptions.ca ??= await fs.readFile(topologyOptions.tlsCAFile);
-      }
-      if (typeof topologyOptions.tlsCRLFile === 'string') {
-        topologyOptions.crl ??= await fs.readFile(topologyOptions.tlsCRLFile);
-      }
-      if (typeof topologyOptions.tlsCertificateKeyFile === 'string') {
-        if (!topologyOptions.key || !topologyOptions.cert) {
-          const contents = await fs.readFile(topologyOptions.tlsCertificateKeyFile);
-          topologyOptions.key ??= contents;
-          topologyOptions.cert ??= contents;
-        }
-      }
-    }
-    if (typeof topologyOptions.srvHost === 'string') {
-      const hosts = await resolveSRVRecord(topologyOptions);
-
-      for (const [index, host] of hosts.entries()) {
-        topologyOptions.hosts[index] = host;
-      }
-    }
-
-    // It is important to perform validation of hosts AFTER SRV resolution, to check the real hostname,
-    // but BEFORE we even attempt connecting with a potentially not allowed hostname
-    if (topologyOptions.credentials?.mechanism === AuthMechanism.MONGODB_OIDC) {
-      const allowedHosts =
-        topologyOptions.credentials?.mechanismProperties?.ALLOWED_HOSTS || DEFAULT_ALLOWED_HOSTS;
-      const isServiceAuth = !!topologyOptions.credentials?.mechanismProperties?.ENVIRONMENT;
-      if (!isServiceAuth) {
-        for (const host of topologyOptions.hosts) {
-          if (!hostMatchesWildcards(host.toHostPort().host, allowedHosts)) {
-            throw new MongoInvalidArgumentError(
-              `Host '${host}' is not valid for OIDC authentication with ALLOWED_HOSTS of '${allowedHosts.join(
-                ','
-              )}'`
-            );
-          }
-        }
-      }
-    }
-
-    this.topology = new Topology(this, topologyOptions.hosts, topologyOptions);
-    // Events can be emitted before initialization is complete so we have to
-    // save the reference to the topology on the client ASAP if the event handlers need to access it
-
-    this.topology.once(Topology.OPEN, () => this.emit('open', this));
-
-    for (const event of MONGO_CLIENT_EVENTS) {
-      this.topology.on(event, (...args: any[]) => this.emit(event, ...(args as any)));
-    }
-
-    return this.topology;
   }
 
   /**
@@ -643,7 +565,7 @@ export class MongoClient extends TypedEventEmitter<MongoClientEvents> {
 
     // clear out references to old topology
     const topology = this.topology;
-    this.topology = undefined;
+    // this.topology = undefined;
 
     topology.close();
 

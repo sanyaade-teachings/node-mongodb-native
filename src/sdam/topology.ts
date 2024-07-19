@@ -1,14 +1,18 @@
+import * as fs from 'fs/promises';
+
 import type { BSONSerializeOptions, Document } from '../bson';
-import type { MongoCredentials } from '../cmap/auth/mongo_credentials';
+import { DEFAULT_ALLOWED_HOSTS, type MongoCredentials } from '../cmap/auth/mongo_credentials';
+import { AuthMechanism } from '../cmap/auth/providers';
 import type { ConnectionEvents } from '../cmap/connection';
 import type { ConnectionPoolEvents } from '../cmap/connection_pool';
 import type { ClientMetadata } from '../cmap/handshake/client_metadata';
-import { DEFAULT_OPTIONS, FEATURE_FLAGS } from '../connection_string';
+import { DEFAULT_OPTIONS, FEATURE_FLAGS, resolveSRVRecord } from '../connection_string';
 import {
   CLOSE,
   CONNECT,
   ERROR,
   LOCAL_SERVER_EVENTS,
+  MONGO_CLIENT_EVENTS,
   OPEN,
   SERVER_CLOSED,
   SERVER_DESCRIPTION_CHANGED,
@@ -24,12 +28,13 @@ import {
   type MongoDriverError,
   MongoError,
   MongoErrorLabel,
+  MongoInvalidArgumentError,
   MongoOperationTimeoutError,
   MongoRuntimeError,
   MongoServerSelectionError,
   MongoTopologyClosedError
 } from '../error';
-import type { MongoClient, ServerApi } from '../mongo_client';
+import type { MongoClient, MongoOptions, ServerApi } from '../mongo_client';
 import { MongoLoggableComponent, type MongoLogger, SeverityLevel } from '../mongo_logger';
 import { TypedEventEmitter } from '../mongo_types';
 import { ReadPreference, type ReadPreferenceLike } from '../read_preference';
@@ -40,6 +45,7 @@ import {
   type Callback,
   type EventEmitterWithState,
   HostAddress,
+  hostMatchesWildcards,
   List,
   makeStateMachine,
   now,
@@ -209,7 +215,7 @@ export type TopologyEvents = {
  */
 export class Topology extends TypedEventEmitter<TopologyEvents> {
   /** @internal */
-  s: TopologyPrivate;
+  s!: TopologyPrivate;
   /** @internal */
   [kWaitQueue]: List<ServerSelectionRequest>;
   /** @internal */
@@ -217,10 +223,7 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
   /** @internal */
   _type?: string;
 
-  client!: MongoClient;
-
-  /** @internal */
-  private connectionLock?: Promise<Topology>;
+  client: MongoClient;
 
   /** @internal */
   stateTransition: (newState: string) => void;
@@ -248,19 +251,66 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
   /** @event */
   static readonly TIMEOUT = TIMEOUT;
 
+  private options: MongoOptions;
+
   /**
    * @param seedlist - a list of HostAddress instances to connect to
    */
-  constructor(
-    client: MongoClient,
-    seeds: string | string[] | HostAddress | HostAddress[],
-    options: TopologyOptions
-  ) {
+  constructor(client: MongoClient, options: MongoOptions) {
     super();
-
     this.stateTransition = stateTransition.bind(null, this);
-
     this.client = client;
+    this.options = options;
+    this[kWaitQueue] = new List();
+  }
+
+  async init() {
+    let { options } = this;
+
+    if (options.tls) {
+      if (typeof options.tlsCAFile === 'string') {
+        options.ca ??= await fs.readFile(options.tlsCAFile);
+      }
+      if (typeof options.tlsCRLFile === 'string') {
+        options.crl ??= await fs.readFile(options.tlsCRLFile);
+      }
+      if (typeof options.tlsCertificateKeyFile === 'string') {
+        if (!options.key || !options.cert) {
+          const contents = await fs.readFile(options.tlsCertificateKeyFile);
+          options.key ??= contents;
+          options.cert ??= contents;
+        }
+      }
+    }
+    if (typeof options.srvHost === 'string') {
+      const hosts = await resolveSRVRecord(options);
+
+      for (const [index, host] of hosts.entries()) {
+        options.hosts[index] = host;
+      }
+    }
+
+    // It is important to perform validation of hosts AFTER SRV resolution, to check the real hostname,
+    // but BEFORE we even attempt connecting with a potentially not allowed hostname
+    if (options.credentials?.mechanism === AuthMechanism.MONGODB_OIDC) {
+      const allowedHosts =
+        options.credentials?.mechanismProperties?.ALLOWED_HOSTS || DEFAULT_ALLOWED_HOSTS;
+      const isServiceAuth = !!options.credentials?.mechanismProperties?.ENVIRONMENT;
+      if (!isServiceAuth) {
+        for (const host of options.hosts) {
+          if (!hostMatchesWildcards(host.toHostPort().host, allowedHosts)) {
+            throw new MongoInvalidArgumentError(
+              `Host '${host}' is not valid for OIDC authentication with ALLOWED_HOSTS of '${allowedHosts.join(
+                ','
+              )}'`
+            );
+          }
+        }
+      }
+    }
+
+    let { hosts: seeds } = options;
+
     // Options should only be undefined in tests, MongoClient will always have defined options
     options = options ?? {
       hosts: [HostAddress.fromString('localhost:27017')],
@@ -301,7 +351,6 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
       serverDescriptions.set(hostAddress.toString(), new ServerDescription(hostAddress));
     }
 
-    this[kWaitQueue] = new List();
     this.s = {
       // the id of this topology
       id: topologyId,
@@ -335,11 +384,12 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
       detectSrvRecords: ev => this.detectSrvRecords(ev)
     };
 
-    this.mongoLogger = client.mongoLogger;
+    this.mongoLogger = this.client.mongoLogger;
     this.component = 'topology';
 
     if (options.srvHost && !options.loadBalanced) {
       this.s.srvPoller =
+        // @ts-expect-error: todo
         options.srvPoller ??
         new SrvPoller({
           heartbeatFrequencyMS: this.s.heartbeatFrequencyMS,
@@ -350,7 +400,15 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
 
       this.on(Topology.TOPOLOGY_DESCRIPTION_CHANGED, this.s.detectShardedTopology);
     }
-    this.connectionLock = undefined;
+
+    // Events can be emitted before initialization is complete so we have to
+    // save the reference to the topology on the client ASAP if the event handlers need to access it
+
+    this.once(Topology.OPEN, () => this.client.emit('open', this.client));
+
+    for (const event of MONGO_CLIENT_EVENTS) {
+      this.on(event, (...args: any[]) => this.client.emit(event, ...(args as any)));
+    }
   }
 
   private detectShardedTopology(event: TopologyDescriptionChangedEvent) {
@@ -452,8 +510,9 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
     selector: string | ReadPreference | ServerSelector,
     options: SelectServerOptions
   ): Promise<Server> {
-    const shouldInitialize = !this.isConnected();
+    const shouldInitialize = this.s == null;
     if (shouldInitialize) {
+      await this.init();
       this.stateTransition(STATE_CONNECTING);
       // emit SDAM monitoring events
       this.emitAndLog(Topology.TOPOLOGY_OPENING, new TopologyOpeningEvent(this.s.id));
