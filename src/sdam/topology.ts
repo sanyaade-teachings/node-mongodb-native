@@ -61,6 +61,7 @@ import {
   STATE_CLOSING,
   STATE_CONNECTED,
   STATE_CONNECTING,
+  STATE_UNITIALIZED,
   type TimerQueue,
   TopologyType
 } from './common';
@@ -89,6 +90,7 @@ import { TopologyDescription } from './topology_description';
 let globalTopologyCounter = 0;
 
 const stateTransition = makeStateMachine({
+  [STATE_UNITIALIZED]: [STATE_CONNECTING, STATE_CLOSING],
   [STATE_CLOSED]: [STATE_CLOSED, STATE_CONNECTING],
   [STATE_CONNECTING]: [STATE_CONNECTING, STATE_CLOSING, STATE_CONNECTED, STATE_CLOSED],
   [STATE_CONNECTED]: [STATE_CONNECTED, STATE_CLOSING, STATE_CLOSED],
@@ -215,7 +217,7 @@ export type TopologyEvents = {
  */
 export class Topology extends TypedEventEmitter<TopologyEvents> {
   /** @internal */
-  s!: TopologyPrivate;
+  s: TopologyPrivate;
   /** @internal */
   [kWaitQueue]: List<ServerSelectionRequest>;
   /** @internal */
@@ -262,6 +264,55 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
     this.client = client;
     this.options = options;
     this[kWaitQueue] = new List();
+
+    const topologyId = globalTopologyCounter++;
+    this.s = {
+      // the id of this topology
+      id: topologyId,
+      // passed in options
+      options,
+      seedlist: [],
+      // initial state
+      state: STATE_UNITIALIZED,
+      // the topology description
+      description: new TopologyDescription(TopologyType.Unknown),
+      serverSelectionTimeoutMS: options.serverSelectionTimeoutMS,
+      heartbeatFrequencyMS: options.heartbeatFrequencyMS,
+      minHeartbeatFrequencyMS: options.minHeartbeatFrequencyMS,
+      // a map of server instances to normalized addresses
+      servers: new Map(),
+      credentials: options?.credentials,
+      clusterTime: undefined,
+
+      // timer management
+      connectionTimers: new Set<NodeJS.Timeout>(),
+      detectShardedTopology: ev => this.detectShardedTopology(ev),
+      detectSrvRecords: ev => this.detectSrvRecords(ev)
+    };
+    this.mongoLogger = this.client.mongoLogger;
+    this.component = 'topology';
+
+    if (options.srvHost && !options.loadBalanced) {
+      this.s.srvPoller =
+        // @ts-expect-error: todo
+        options.srvPoller ??
+        new SrvPoller({
+          heartbeatFrequencyMS: this.s.heartbeatFrequencyMS,
+          srvHost: options.srvHost,
+          srvMaxHosts: options.srvMaxHosts,
+          srvServiceName: options.srvServiceName
+        });
+
+      this.on(Topology.TOPOLOGY_DESCRIPTION_CHANGED, this.s.detectShardedTopology);
+    }
+    // Events can be emitted before initialization is complete so we have to
+    // save the reference to the topology on the client ASAP if the event handlers need to access it
+
+    this.once(Topology.OPEN, () => this.client.emit('open', this.client));
+
+    for (const event of MONGO_CLIENT_EVENTS) {
+      this.on(event, (...args: any[]) => this.client.emit(event, ...(args as any)));
+    }
   }
 
   async init() {
@@ -337,7 +388,6 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
     }
 
     const topologyType = topologyTypeFromOptions(options);
-    const topologyId = globalTopologyCounter++;
 
     const selectedHosts =
       options.srvMaxHosts == null ||
@@ -351,64 +401,17 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
       serverDescriptions.set(hostAddress.toString(), new ServerDescription(hostAddress));
     }
 
-    this.s = {
-      // the id of this topology
-      id: topologyId,
-      // passed in options
-      options,
-      // initial seedlist of servers to connect to
-      seedlist,
-      // initial state
-      state: STATE_CLOSED,
-      // the topology description
-      description: new TopologyDescription(
-        topologyType,
-        serverDescriptions,
-        options.replicaSet,
-        undefined,
-        undefined,
-        undefined,
-        options
-      ),
-      serverSelectionTimeoutMS: options.serverSelectionTimeoutMS,
-      heartbeatFrequencyMS: options.heartbeatFrequencyMS,
-      minHeartbeatFrequencyMS: options.minHeartbeatFrequencyMS,
-      // a map of server instances to normalized addresses
-      servers: new Map(),
-      credentials: options?.credentials,
-      clusterTime: undefined,
-
-      // timer management
-      connectionTimers: new Set<NodeJS.Timeout>(),
-      detectShardedTopology: ev => this.detectShardedTopology(ev),
-      detectSrvRecords: ev => this.detectSrvRecords(ev)
-    };
-
-    this.mongoLogger = this.client.mongoLogger;
-    this.component = 'topology';
-
-    if (options.srvHost && !options.loadBalanced) {
-      this.s.srvPoller =
-        // @ts-expect-error: todo
-        options.srvPoller ??
-        new SrvPoller({
-          heartbeatFrequencyMS: this.s.heartbeatFrequencyMS,
-          srvHost: options.srvHost,
-          srvMaxHosts: options.srvMaxHosts,
-          srvServiceName: options.srvServiceName
-        });
-
-      this.on(Topology.TOPOLOGY_DESCRIPTION_CHANGED, this.s.detectShardedTopology);
-    }
-
-    // Events can be emitted before initialization is complete so we have to
-    // save the reference to the topology on the client ASAP if the event handlers need to access it
-
-    this.once(Topology.OPEN, () => this.client.emit('open', this.client));
-
-    for (const event of MONGO_CLIENT_EVENTS) {
-      this.on(event, (...args: any[]) => this.client.emit(event, ...(args as any)));
-    }
+    this.s.description = new TopologyDescription(
+      topologyType,
+      serverDescriptions,
+      options.replicaSet,
+      undefined,
+      undefined,
+      undefined,
+      options
+    );
+    // initial seedlist of servers to connect to
+    this.s.seedlist = seedlist;
   }
 
   private detectShardedTopology(event: TopologyDescriptionChangedEvent) {
@@ -510,7 +513,7 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
     selector: string | ReadPreference | ServerSelector,
     options: SelectServerOptions
   ): Promise<Server> {
-    const shouldInitialize = this.s == null;
+    const shouldInitialize = this.s.state === STATE_UNITIALIZED;
     if (shouldInitialize) {
       await this.init();
       this.stateTransition(STATE_CONNECTING);
