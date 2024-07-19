@@ -9,6 +9,7 @@ export const STATE_CLOSING = 'closing';
 export const STATE_CLOSED = 'closed';
 export const STATE_CONNECTING = 'connecting';
 export const STATE_CONNECTED = 'connected';
+export const STATE_UNITIALIZED = 'unitialized';
 
 /**
  * An enumeration of topology types we know about
