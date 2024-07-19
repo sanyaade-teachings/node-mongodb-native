@@ -24,7 +24,6 @@ import {
   type MongoDriverError,
   MongoError,
   MongoErrorLabel,
-  MongoNetworkTimeoutError,
   MongoOperationTimeoutError,
   MongoRuntimeError,
   MongoServerSelectionError,
@@ -35,7 +34,7 @@ import { MongoLoggableComponent, type MongoLogger, SeverityLevel } from '../mong
 import { TypedEventEmitter } from '../mongo_types';
 import { ReadPreference, type ReadPreferenceLike } from '../read_preference';
 import type { ClientSession } from '../sessions';
-import { Timeout, TimeoutContext, TimeoutError } from '../timeout';
+import { Timeout, type TimeoutContext, TimeoutError } from '../timeout';
 import type { Transaction } from '../transactions';
 import {
   type Callback,
@@ -44,8 +43,6 @@ import {
   List,
   makeStateMachine,
   now,
-  ns,
-  once,
   promiseWithResolvers,
   shuffle
 } from '../utils';
@@ -225,6 +222,9 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
   /** @internal */
   private connectionLock?: Promise<Topology>;
 
+  /** @internal */
+  stateTransition: (newState: string) => void;
+
   /** @event */
   static readonly SERVER_OPENING = SERVER_OPENING;
   /** @event */
@@ -257,6 +257,8 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
     options: TopologyOptions
   ) {
     super();
+
+    this.stateTransition = stateTransition.bind(null, this);
 
     this.client = client;
     // Options should only be undefined in tests, MongoClient will always have defined options
@@ -408,112 +410,6 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
     return new ServerCapabilities(this.lastHello());
   }
 
-  /** Initiate server connect */
-  async connect(options?: ConnectOptions): Promise<Topology> {
-    this.connectionLock ??= this._connect(options);
-    try {
-      await this.connectionLock;
-      return this;
-    } finally {
-      this.connectionLock = undefined;
-    }
-
-    return this;
-  }
-
-  private async _connect(options?: ConnectOptions): Promise<Topology> {
-    options = options ?? {};
-    if (this.s.state === STATE_CONNECTED) {
-      return this;
-    }
-
-    stateTransition(this, STATE_CONNECTING);
-
-    // emit SDAM monitoring events
-    this.emitAndLog(Topology.TOPOLOGY_OPENING, new TopologyOpeningEvent(this.s.id));
-
-    // emit an event for the topology change
-    this.emitAndLog(
-      Topology.TOPOLOGY_DESCRIPTION_CHANGED,
-      new TopologyDescriptionChangedEvent(
-        this.s.id,
-        new TopologyDescription(TopologyType.Unknown), // initial is always Unknown
-        this.s.description
-      )
-    );
-
-    // Create a wait condition that blocks until we get at least once successful heartbeat
-    const heartbeatWaitCond = once(this, Server.SERVER_HEARTBEAT_SUCCEEDED);
-    // connect all known servers, then attempt server selection to connect
-    const serverDescriptions = Array.from(this.s.description.servers.values());
-    this.s.servers = new Map(
-      serverDescriptions.map(serverDescription => [
-        serverDescription.address,
-        createAndConnectServer(this, serverDescription)
-      ])
-    );
-
-    // In load balancer mode we need to fake a server description getting
-    // emitted from the monitor, since the monitor doesn't exist.
-    if (this.s.options.loadBalanced) {
-      for (const description of serverDescriptions) {
-        const newDescription = new ServerDescription(description.hostAddress, undefined, {
-          loadBalanced: this.s.options.loadBalanced
-        });
-        this.serverUpdateHandler(newDescription);
-      }
-    }
-
-    try {
-      const skipPingOnConnect = this.s.options[Symbol.for('@@mdb.skipPingOnConnect')] === true;
-      if (!skipPingOnConnect && this.s.credentials) {
-        const timeoutMS = this.client.s.options.timeoutMS;
-        const serverSelectionTimeoutMS = this.client.s.options.serverSelectionTimeoutMS;
-        const readPreference = options.readPreference ?? ReadPreference.primary;
-        const timeoutContext = TimeoutContext.create({
-          timeoutMS,
-          serverSelectionTimeoutMS,
-          waitQueueTimeoutMS: this.client.s.options.waitQueueTimeoutMS
-        });
-        const selectServerOptions = {
-          operationName: 'ping',
-          ...options,
-          timeoutContext
-        };
-        const server = await this.selectServer(
-          readPreferenceServerSelector(readPreference),
-          selectServerOptions
-        );
-        await server.command(ns('admin.$cmd'), { ping: 1 }, { timeoutContext });
-        stateTransition(this, STATE_CONNECTED);
-        this.emit(Topology.OPEN, this);
-        this.emit(Topology.CONNECT, this);
-
-        return this;
-      } else if (!this.s.options.loadBalanced) {
-        try {
-          await Promise.race([
-            Timeout.expires(this.client.s.options.serverSelectionTimeoutMS),
-            heartbeatWaitCond
-          ]);
-        } catch (error) {
-          throw new MongoNetworkTimeoutError(
-            `Failed to contact server after ${this.client.s.options.serverSelectionTimeoutMS}ms`
-          );
-        }
-      }
-
-      stateTransition(this, STATE_CONNECTED);
-      this.emit(Topology.OPEN, this);
-      this.emit(Topology.CONNECT, this);
-
-      return this;
-    } catch (error) {
-      this.close();
-      throw error;
-    }
-  }
-
   /** Close this topology */
   close(): void {
     if (this.s.state === STATE_CLOSED || this.s.state === STATE_CLOSING) {
@@ -526,7 +422,7 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
 
     this.s.servers.clear();
 
-    stateTransition(this, STATE_CLOSING);
+    this.stateTransition(STATE_CLOSING);
 
     drainWaitQueue(this[kWaitQueue], new MongoTopologyClosedError());
     drainTimerQueue(this.s.connectionTimers);
@@ -538,7 +434,7 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
 
     this.removeListener(Topology.TOPOLOGY_DESCRIPTION_CHANGED, this.s.detectShardedTopology);
 
-    stateTransition(this, STATE_CLOSED);
+    this.stateTransition(STATE_CLOSED);
 
     // emit an event for close
     this.emitAndLog(Topology.TOPOLOGY_CLOSED, new TopologyClosedEvent(this.s.id));
@@ -556,6 +452,42 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
     selector: string | ReadPreference | ServerSelector,
     options: SelectServerOptions
   ): Promise<Server> {
+    if (!this.isConnected()) {
+      this.stateTransition(STATE_CONNECTING);
+      // emit SDAM monitoring events
+      this.emitAndLog(Topology.TOPOLOGY_OPENING, new TopologyOpeningEvent(this.s.id));
+
+      // emit an event for the topology change
+      this.emitAndLog(
+        Topology.TOPOLOGY_DESCRIPTION_CHANGED,
+        new TopologyDescriptionChangedEvent(
+          this.s.id,
+          new TopologyDescription(TopologyType.Unknown), // initial is always Unknown
+          this.s.description
+        )
+      );
+
+      // connect all known servers, then attempt server selection to connect
+      const serverDescriptions = Array.from(this.s.description.servers.values());
+      this.s.servers = new Map(
+        serverDescriptions.map(serverDescription => [
+          serverDescription.address,
+          createAndConnectServer(this, serverDescription)
+        ])
+      );
+
+      // In load balancer mode we need to fake a server description getting
+      // emitted from the monitor, since the monitor doesn't exist.
+      if (this.s.options.loadBalanced) {
+        for (const description of serverDescriptions) {
+          const newDescription = new ServerDescription(description.hostAddress, undefined, {
+            loadBalanced: this.s.options.loadBalanced
+          });
+          this.serverUpdateHandler(newDescription);
+        }
+      }
+    }
+
     let serverSelector;
     if (typeof selector !== 'function') {
       if (typeof selector === 'string') {

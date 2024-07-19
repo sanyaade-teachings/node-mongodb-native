@@ -674,6 +674,7 @@ export class Collection<TSchema extends Document = Document> {
       );
       return true;
     } catch {
+      // TODO: Make sure we throw on MongoOperationTimeoutError
       return false;
     }
   }

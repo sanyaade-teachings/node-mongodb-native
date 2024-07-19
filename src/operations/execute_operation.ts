@@ -16,6 +16,7 @@ import {
 } from '../error';
 import type { MongoClient } from '../mongo_client';
 import { ReadPreference } from '../read_preference';
+import { STATE_CONNECTING } from '../sdam/common';
 import type { ServerDescription } from '../sdam/server_description';
 import {
   sameServerSelector,
@@ -136,18 +137,16 @@ async function autoConnect(client: MongoClient): Promise<Topology> {
     if (client.s.hasBeenClosed) {
       throw new MongoNotConnectedError('Client must be connected before running operations');
     }
-    client.s.options[Symbol.for('@@mdb.skipPingOnConnect')] = true;
-    try {
-      await client.connect();
-      if (client.topology == null) {
-        throw new MongoRuntimeError(
-          'client.connect did not create a topology but also did not throw'
-        );
-      }
-      return client.topology;
-    } finally {
-      delete client.s.options[Symbol.for('@@mdb.skipPingOnConnect')];
+    await client._connectWithLock({ skipPing: true });
+    if (client.topology == null) {
+      throw new MongoRuntimeError(
+        'client.connect did not create a topology but also did not throw'
+      );
     }
+
+    // @ts-expect-error Typescript can't pick up client.conectWithLock sets topology to a non-nullish value
+    client.topology.stateTransition(STATE_CONNECTING);
+    return client.topology;
   }
   return client.topology;
 }
