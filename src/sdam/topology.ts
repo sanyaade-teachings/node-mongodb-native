@@ -257,6 +257,7 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
 
   /**
    * @param seedlist - a list of HostAddress instances to connect to
+   *  TODO(NODE-5682): don't pass in entire MongoOptions object
    */
   constructor(client: MongoClient, options: MongoOptions) {
     super();
@@ -293,9 +294,8 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
     this.component = 'topology';
 
     if (options.srvHost && !options.loadBalanced) {
-      this.s.srvPoller =
-        // @ts-expect-error: todo
-        options.srvPoller ??
+      // @ts-expect-error: todo
+      options.srvPoller ??
         new SrvPoller({
           heartbeatFrequencyMS: this.s.heartbeatFrequencyMS,
           srvHost: options.srvHost,
@@ -510,7 +510,7 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
    * @returns An instance of a `Server` meeting the criteria of the predicate provided
    */
   async selectServer(
-    selector: string | ReadPreference | ServerSelector,
+    selector: string | ReadPreference | ServerSelector | undefined,
     options: SelectServerOptions
   ): Promise<Server> {
     const shouldInitialize = this.s.state === STATE_UNITIALIZED;
@@ -576,7 +576,7 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
     ) {
       this.client.mongoLogger?.debug(
         MongoLoggableComponent.SERVER_SELECTION,
-        new ServerSelectionStartedEvent(selector, this.description, options.operationName)
+        new ServerSelectionStartedEvent(serverSelector, this.description, options.operationName)
       );
     }
     let timeout;
@@ -599,7 +599,7 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
         this.client.mongoLogger?.debug(
           MongoLoggableComponent.SERVER_SELECTION,
           new ServerSelectionSucceededEvent(
-            selector,
+            serverSelector,
             this.description,
             transaction.server.pool.address,
             options.operationName
@@ -662,7 +662,7 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
           this.client.mongoLogger?.debug(
             MongoLoggableComponent.SERVER_SELECTION,
             new ServerSelectionFailedEvent(
-              selector,
+              serverSelector,
               this.description,
               timeoutError,
               options.operationName
