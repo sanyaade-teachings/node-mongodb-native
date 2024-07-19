@@ -452,7 +452,8 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
     selector: string | ReadPreference | ServerSelector,
     options: SelectServerOptions
   ): Promise<Server> {
-    if (!this.isConnected()) {
+    const shouldInitialize = !this.isConnected();
+    if (shouldInitialize) {
       this.stateTransition(STATE_CONNECTING);
       // emit SDAM monitoring events
       this.emitAndLog(Topology.TOPOLOGY_OPENING, new TopologyOpeningEvent(this.s.id));
@@ -544,6 +545,11 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
         );
       }
       if (options.timeoutContext?.clearServerSelectionTimeout) timeout?.clear();
+      if (shouldInitialize) {
+        this.stateTransition(STATE_CONNECTED);
+        this.emit(Topology.OPEN, this);
+        this.emit(Topology.CONNECT, this);
+      }
       return transaction.server;
     }
 
@@ -570,6 +576,11 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
       const server = await (timeout ? Promise.race([serverPromise, timeout]) : serverPromise);
       if (options.timeoutContext?.csotEnabled() && server.description.minRoundTripTime !== 0) {
         options.timeoutContext.minRoundTripTime = server.description.minRoundTripTime;
+      }
+      if (shouldInitialize) {
+        this.stateTransition(STATE_CONNECTED);
+        this.emit(Topology.OPEN, this);
+        this.emit(Topology.CONNECT, this);
       }
       return server;
     } catch (error) {
@@ -603,6 +614,10 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
           });
         }
         throw timeoutError;
+      }
+
+      if (shouldInitialize) {
+        this.close();
       }
       // Other server selection error
       throw error;
