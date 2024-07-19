@@ -513,10 +513,7 @@ export class MongoClient extends TypedEventEmitter<MongoClientEvents> {
       try {
         const skipPingOnConnect = this.s.options[Symbol.for('@@mdb.skipPingOnConnect')] === true;
         if (!skipPingOnConnect && !options?.skipPing && topology.s.credentials != null) {
-          await this.db().admin().ping({ readPreference }); // performs server selection and sends ping
-          topology.stateTransition(STATE_CONNECTED);
-          topology.emit(Topology.OPEN, topology);
-          topology.emit(Topology.CONNECT, topology);
+          await this.db().admin().ping({ readPreference }); // goes through `executeOperation` so performs server selection
         }
       } catch (error) {
         topology.close();
